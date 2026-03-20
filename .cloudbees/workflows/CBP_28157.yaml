@@ -1,0 +1,114 @@
+apiVersion: automation.cloudbees.io/v1alpha1
+kind: workflow
+name: Build and Deploy
+
+on:
+  push:
+    branches:
+      - "**"
+
+permissions:
+  scm-token-own: read
+  scm-token-org: read
+  id-token: write
+
+env:
+  region: us-east-1
+
+jobs:
+  build:
+    environment: deploy_infra
+    steps:
+      - name: Get source code
+        uses: cloudbees-io/checkout@v1
+      
+      - name: Setup git credentials
+        uses: cloudbees-io/configure-git-global-credentials@v1
+      
+      - name: Get environment configuration
+        uses: cloudbees-io/checkout@v1
+        with:
+          repository: cloudbees/cbp-vpc-vpc-install-3
+          path: cbp-vpc-vpc-install-3
+
+      - name: Login to AWS
+        uses: cloudbees-io/configure-aws-credentials@v1
+        with:
+          aws-region: us-east-1
+          role-to-assume: ${{ vars.unify_vpc_3_platform_workflow_role}}
+          role-duration-seconds: 3600
+
+      - name: Slack notification
+        if: ${{ cloudbees.scm.branch == 'main' }}
+        uses: docker://golang:1.22-alpine
+        id: slack
+        shell: sh
+        run: |
+          slack_timestamp="$(./ci/slack_notification.sh "${{ vars.SLACK_CHANNEL_ID }}" "${{ secrets.SAAS_SRE_SLACK_BOT_TOKEN }}" "Starting" "${{ env.region }}" "${{ vars.WORKFLOW_URL }}")"
+          echo "$slack_timestamp" | tr -d '\n' > $CLOUDBEES_OUTPUTS/slack_timestamp
+
+      - id: build-and-test
+        if: ${{ cloudbees.scm.branch != 'main' }}
+        name: Build and test VPC install package
+        uses: docker://golang:1.25-alpine
+        env:
+          AWS_REGION: ${{ env.region }}
+          GITHUB_TOKEN: ${{ cloudbees.scm.token }}          
+          PULUMI_CONFIG_PASSPHRASE: ${{ secrets.PULUMI_PASSPHRASE }}
+          PULUMI_K8S_ENABLE_PATCH_FORCE: true
+          SMTP_HOST: ${{ vars.VPC_SMTP_HOST }}
+          SMTP_EMAIL_ADDRESS_FROM: ${{ vars.VPC_SMTP_EMAILADDRESSFROM }}
+          SMTP_FROM_DISPLAY_NAME: ${{ vars.VPC_SMTP_FROMDISPLAYNAME }}
+          SMTP_USER: ${{ secrets.VPC_SMTP_USERNAME }}
+          TIMESCALEDB_HOST: ${{ vars.VPC_TIMESCALEDB_HOST }}
+          TIMESCALEDB_DATABASE: ${{ vars.VPC_TIMESCALEDB_DATABASE }}
+          TIMESCALEDB_USERNAME: ${{ secrets.VPC_TIMESCALEDB_USERNAME }}
+          APIDAO_FM_ENV_ID: DUMMY-VALUE-CHANGE-ME
+        shell: sh
+        run: |
+          export APIDAO_FM_ENV_ID=DUMMY-VALUE-CHANGE-ME
+          ./ci/preview.sh
+          if [ $? -ne 0 ]; then
+            echo "preview failed"
+            exit 1
+          fi
+
+      - id: build-and-deploy
+        if: ${{ cloudbees.scm.branch == 'main' }}
+        name: Build and deploy VPC install package
+        uses: docker://golang:1.25-alpine
+        env:
+          AWS_REGION: ${{ env.region }}
+          GITHUB_TOKEN: ${{ cloudbees.scm.token }}          
+          PULUMI_CONFIG_PASSPHRASE: ${{ secrets.PULUMI_PASSPHRASE }}
+          PULUMI_K8S_ENABLE_PATCH_FORCE: true
+          SMTP_HOST: ${{ vars.VPC_SMTP_HOST }}
+          SMTP_EMAIL_ADDRESS_FROM: ${{ vars.VPC_SMTP_EMAILADDRESSFROM }}
+          SMTP_FROM_DISPLAY_NAME: ${{ vars.VPC_SMTP_FROMDISPLAYNAME }}
+          SMTP_USER: ${{ secrets.VPC_SMTP_USERNAME }}
+          TIMESCALEDB_HOST: ${{ vars.VPC_TIMESCALEDB_HOST }}
+          TIMESCALEDB_DATABASE: ${{ vars.VPC_TIMESCALEDB_DATABASE }}
+          TIMESCALEDB_USERNAME: ${{ secrets.VPC_TIMESCALEDB_USERNAME }}
+          APIDAO_FM_ENV_ID: DUMMY-VALUE-CHANGE-ME
+        shell: sh
+        run: |
+          export APIDAO_FM_ENV_ID=DUMMY-VALUE-CHANGE-ME
+          ./ci/deploy.sh
+          if [ $? -ne 0 ]; then
+            echo "deploy failed"
+            exit 1
+          fi
+
+      - name: Slack notification
+        if: ${{ cloudbees.scm.branch == 'main' }}
+        uses: docker://golang:1.22-alpine
+        shell: sh
+        run: |
+          ./ci/slack_notification.sh "${{ vars.SLACK_CHANNEL_ID }}" "${{ secrets.SAAS_SRE_SLACK_BOT_TOKEN }}" "Successful" "${{ env.region }}" "${{ vars.WORKFLOW_URL }}" "${{ steps.slack.outputs.slack_timestamp }}"
+
+      - name: Fallback for failure notification
+        if: ${{ failure() && cloudbees.scm.branch == 'main' }}
+        uses: docker://golang:1.22-alpine
+        shell: sh
+        run: |
+          ./ci/slack_notification.sh "${{ vars.SLACK_CHANNEL_ID }}" "${{ secrets.SAAS_SRE_SLACK_BOT_TOKEN }}" "Failed" "${{ env.region }}" "${{ vars.WORKFLOW_URL }}" "${{ steps.slack.outputs.slack_timestamp }}"
